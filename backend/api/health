@@ -1,0 +1,15 @@
+{
+  "status": "healthy",
+  "version": "15.6.0",
+  "upstox_configured": true,
+  "ml_engine_loaded": true,
+  "decision_engine_loaded": true,
+  "risk_engine_loaded": true,
+  "paper_engine_loaded": true,
+  "monitor_engine_loaded": true,
+  "analytics_engine_loaded": true,
+  "database_loaded": true,
+  "feature_count": 26,
+  "paper_trading": true,
+  "real_order_execution": false
+}

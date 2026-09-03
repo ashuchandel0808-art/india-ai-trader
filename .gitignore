@@ -1,0 +1,36 @@
+# Environment / secrets
+.env
+.env.local
+.env.*.local
+
+# Python
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Node / Next.js
+node_modules/
+.next/
+out/
+dist/
+build/
+
+# OS
+.DS_Store
+
+# Logs
+*.log
+
+# IDE
+.vscode/
+.idea/
+
+# Local database
+database/*.db
+database/*.db-shm
+database/*.db-wal
+
+# Generated ML model
+*.joblib

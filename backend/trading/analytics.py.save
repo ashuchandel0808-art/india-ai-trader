@@ -1,0 +1,4 @@
+cd /Users/ayushchandel/india-ai-trader-v5/backend
+touch trading/analytics.py
+nano trading/analytics.py
+
