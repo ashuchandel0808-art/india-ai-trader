@@ -34,3 +34,6 @@ database/*.db-wal
 
 # Generated ML model
 *.joblib
+!backend/ml_model.joblib
+
+!backend/ml_model.joblib
