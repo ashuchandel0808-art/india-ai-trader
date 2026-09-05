@@ -45,6 +45,7 @@ from datetime import (
     timedelta,
     timezone,
 )
+from zoneinfo import ZoneInfo
 
 from typing import (
     Any,
@@ -121,7 +122,12 @@ UPSTOX_ACCESS_TOKEN = os.getenv(
 
 PAPER_TRADING_ENABLED = True
 
+# Safety: real-money execution is intentionally disabled.
 REAL_ORDER_EXECUTION = False
+
+APP_VERSION = "16.0.0"
+MARKET_TIMEZONE = ZoneInfo("Asia/Kolkata")
+CANDLE_MAX_STALENESS_MINUTES = 15
 
 
 # ============================================================
@@ -858,7 +864,7 @@ MONITOR_INTERVAL_SECONDS = 5
 
 app = FastAPI(
     title="India AI Trader V16",
-    version="16.0.0",
+    version=APP_VERSION,
     description=(
         "Integrated AI trading research, "
         "paper execution, risk management, "
@@ -871,14 +877,23 @@ app = FastAPI(
 # CORS
 # ============================================================
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=[
+_configured_origins = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("CORS_ORIGINS", "").split(",")
+    if origin.strip()
+]
+
+if not _configured_origins:
+    _configured_origins = [
         "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:3001",
         "http://127.0.0.1:3001",
-    ],
+    ]
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_configured_origins,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -1182,42 +1197,109 @@ def save_json(
     )
 
 
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Parse a timestamp into timezone-aware UTC."""
+    if value is None:
+        return None
+
+    try:
+        parsed = pd.to_datetime(
+            value,
+            errors="coerce",
+            utc=True,
+        )
+
+        if pd.isna(parsed):
+            return None
+
+        return parsed.to_pydatetime()
+    except Exception:
+        return None
+
+
+def _candle_metadata(
+    candles: Optional[pd.DataFrame],
+    interval_minutes: int = 5,
+) -> Dict[str, Any]:
+    """Return freshness/completeness metadata for the latest candle."""
+    result = {
+        "candle_timestamp": None,
+        "candle_age_seconds": None,
+        "candle_age_minutes": None,
+        "candle_complete": False,
+        "candle_is_stale": True,
+        "candle_data_quality": "UNKNOWN",
+    }
+
+    try:
+        if (
+            candles is None
+            or len(candles) == 0
+            or "timestamp" not in candles.columns
+        ):
+            return result
+
+        latest_raw = candles.iloc[-1]["timestamp"]
+        latest = _parse_timestamp(latest_raw)
+
+        if latest is None:
+            return result
+
+        now = datetime.now(timezone.utc)
+        age_seconds = max(
+            0.0,
+            (now - latest).total_seconds(),
+        )
+        candle_complete = (
+            now >= latest
+            + timedelta(minutes=interval_minutes)
+        )
+        stale = (
+            age_seconds
+            > CANDLE_MAX_STALENESS_MINUTES * 60
+        )
+
+        result.update({
+            "candle_timestamp": str(latest_raw),
+            "candle_age_seconds": round(
+                age_seconds,
+                1,
+            ),
+            "candle_age_minutes": round(
+                age_seconds / 60.0,
+                2,
+            ),
+            "candle_complete": candle_complete,
+            "candle_is_stale": stale,
+            "candle_data_quality": (
+                "STALE"
+                if stale
+                else (
+                    "COMPLETE"
+                    if candle_complete
+                    else "IN_PROGRESS"
+                )
+            ),
+        })
+
+    except Exception:
+        pass
+
+    return result
+
+
 def attach_candle_timestamp(
     analysis,
     candles,
 ):
+    result = dict(analysis)
 
-    result = dict(
-        analysis
+    metadata = _candle_metadata(
+        candles,
+        interval_minutes=5,
     )
 
-    result[
-        "candle_timestamp"
-    ] = None
-
-    try:
-
-        if (
-            candles is not None
-            and
-            len(candles) > 0
-            and
-            "timestamp" in candles.columns
-        ):
-
-            result[
-                "candle_timestamp"
-            ] = str(
-                candles.iloc[-1][
-                    "timestamp"
-                ]
-            )
-
-    except Exception:
-
-        result[
-            "candle_timestamp"
-        ] = None
+    result.update(metadata)
 
     return result
 
@@ -1636,16 +1718,80 @@ def get_single_quote(
 # CANDLES
 # ============================================================
 
+def _parse_upstox_candles(raw_candles) -> List[Dict[str, Any]]:
+    """Normalize Upstox candle arrays into a stable internal schema."""
+    rows: List[Dict[str, Any]] = []
+
+    for candle in raw_candles or []:
+        if not isinstance(candle, (list, tuple)) or len(candle) < 5:
+            continue
+
+        timestamp = candle[0]
+
+        parsed_timestamp = _parse_timestamp(timestamp)
+        if parsed_timestamp is None:
+            continue
+
+        open_price = safe_float(candle[1], np.nan)
+        high_price = safe_float(candle[2], np.nan)
+        low_price = safe_float(candle[3], np.nan)
+        close_price = safe_float(candle[4], np.nan)
+
+        if not all(
+            math.isfinite(value)
+            for value in (
+                open_price,
+                high_price,
+                low_price,
+                close_price,
+            )
+        ):
+            continue
+
+        if high_price < low_price:
+            continue
+
+        rows.append({
+            "timestamp": parsed_timestamp,
+            "open": open_price,
+            "high": high_price,
+            "low": low_price,
+            "close": close_price,
+            "volume": (
+                safe_float(candle[5], 0.0)
+                if len(candle) > 5
+                else 0.0
+            ),
+            "open_interest": (
+                safe_float(candle[6], 0.0)
+                if len(candle) > 6
+                else 0.0
+            ),
+        })
+
+    return rows
+
+
 def fetch_candles(
     instrument_key,
     interval=5,
     days=30,
 ):
+    """
+    Build the live V15 candle set.
 
-    interval = safe_int(
-        interval,
-        5,
-    )
+    Historical data supplies model warm-up.
+    Current-day intraday data supplies the newest market candles.
+
+    The final dataframe is:
+      - timezone-aware
+      - chronologically sorted
+      - timestamp-deduplicated
+      - free of incomplete candles
+      - limited to a safe V15 lookback
+    """
+
+    interval = safe_int(interval, 5)
 
     allowed = {
         1,
@@ -1659,51 +1805,46 @@ def fetch_candles(
     }
 
     if interval not in allowed:
-
         raise HTTPException(
             status_code=400,
             detail=(
                 "Unsupported interval. "
-                "Use "
-                "1,2,3,5,10,15,30,60."
+                "Use 1,2,3,5,10,15,30,60."
             ),
         )
 
     days = max(
         1,
         min(
-            safe_int(
-                days,
-                30,
-            ),
+            safe_int(days, 30),
             30,
         ),
     )
 
+    # Include today's date in the cache key so a process crossing
+    # midnight cannot accidentally reuse yesterday's dataframe.
+    today_ist = datetime.now(
+        MARKET_TIMEZONE
+    ).date()
+
     cache_key = (
         f"{instrument_key}:"
         f"{interval}:"
-        f"{days}"
+        f"{days}:"
+        f"{today_ist.isoformat()}"
     )
 
-    cached = CANDLE_CACHE.get(
-        cache_key
-    )
+    cached = CANDLE_CACHE.get(cache_key)
 
     if cached:
-
         cached_at, dataframe = cached
 
         age = (
-            datetime.now(
-                timezone.utc
-            )
-            -
-            cached_at
+            datetime.now(timezone.utc)
+            - cached_at
         ).total_seconds()
 
         if age < CANDLE_CACHE_SECONDS:
-
             return dataframe.copy()
 
     encoded_key = quote(
@@ -1711,125 +1852,259 @@ def fetch_candles(
         safe="",
     )
 
-    to_date = datetime.now().date()
+    # ---------------------------------------------------------
+    # CURRENT-DAY INTRADAY DATA
+    # ---------------------------------------------------------
 
-    from_date = (
-        to_date -
-        timedelta(
-            days=days
-        )
+    intraday_url = (
+        f"{UPSTOX_V3}"
+        f"/historical-candle/intraday/"
+        f"{encoded_key}/"
+        f"minutes/"
+        f"{interval}"
     )
 
-    url = (
+    intraday_rows: List[Dict[str, Any]] = []
+
+    try:
+        intraday_payload = upstox_get(
+            intraday_url
+        )
+
+        intraday_candles = (
+            intraday_payload
+            .get("data", {})
+            .get("candles", [])
+        )
+
+        intraday_rows = _parse_upstox_candles(
+            intraday_candles
+        )
+
+    except HTTPException as exc:
+        # Do not hide the error if historical data also fails.
+        print(
+            "INTRADAY CANDLE HTTP WARNING:",
+            instrument_key,
+            repr(exc.detail),
+        )
+    except Exception as exc:
+        print(
+            "INTRADAY CANDLE WARNING:",
+            instrument_key,
+            repr(exc),
+        )
+
+    # ---------------------------------------------------------
+    # HISTORICAL DATA
+    # ---------------------------------------------------------
+
+    from_date = (
+        today_ist
+        - timedelta(days=days)
+    )
+
+    historical_url = (
         f"{UPSTOX_V3}"
         f"/historical-candle/"
         f"{encoded_key}/"
         f"minutes/"
         f"{interval}/"
-        f"{to_date}/"
+        f"{today_ist}/"
         f"{from_date}"
     )
 
-    payload = upstox_get(
-        url
-    )
+    historical_rows: List[Dict[str, Any]] = []
 
-    raw_candles = (
-        payload
-        .get(
-            "data",
-            {},
+    try:
+        historical_payload = upstox_get(
+            historical_url
         )
-        .get(
-            "candles",
-            [],
+
+        historical_candles = (
+            historical_payload
+            .get("data", {})
+            .get("candles", [])
         )
-    )
 
-    rows = []
+        historical_rows = _parse_upstox_candles(
+            historical_candles
+        )
 
-    for candle in raw_candles:
+    except HTTPException as exc:
+        print(
+            "HISTORICAL CANDLE HTTP WARNING:",
+            instrument_key,
+            repr(exc.detail),
+        )
+    except Exception as exc:
+        print(
+            "HISTORICAL CANDLE WARNING:",
+            instrument_key,
+            repr(exc),
+        )
 
-        if len(candle) < 6:
-
-            continue
-
-        rows.append({
-            "timestamp":
-                candle[0],
-
-            "open":
-                safe_float(
-                    candle[1]
-                ),
-
-            "high":
-                safe_float(
-                    candle[2]
-                ),
-
-            "low":
-                safe_float(
-                    candle[3]
-                ),
-
-            "close":
-                safe_float(
-                    candle[4]
-                ),
-
-            "volume":
-                safe_float(
-                    candle[5]
-                ),
-
-            "open_interest":
-                (
-                    safe_float(
-                        candle[6]
-                    )
-                    if len(candle) > 6
-                    else 0
-                ),
-        })
+    rows = historical_rows + intraday_rows
 
     if not rows:
-
         raise HTTPException(
             status_code=502,
             detail={
-                "message":
-                    "No historical candle data.",
-                "instrument_key":
-                    instrument_key,
+                "message": "Upstox returned no candle data.",
+                "instrument_key": instrument_key,
+                "interval": interval,
             },
         )
 
+    dataframe = pd.DataFrame(rows)
+
+    # ---------------------------------------------------------
+    # NORMALIZE
+    # ---------------------------------------------------------
+
+    dataframe["timestamp"] = pd.to_datetime(
+        dataframe["timestamp"],
+        errors="coerce",
+        utc=True,
+    )
+
+    dataframe = dataframe.dropna(
+        subset=["timestamp"]
+    )
+
+    for column in [
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "open_interest",
+    ]:
+        dataframe[column] = pd.to_numeric(
+            dataframe[column],
+            errors="coerce",
+        )
+
+    dataframe = dataframe.dropna(
+        subset=[
+            "open",
+            "high",
+            "low",
+            "close",
+        ]
+    )
+
+    # Reject impossible prices.
+    dataframe = dataframe[
+        (dataframe["open"] > 0)
+        & (dataframe["high"] > 0)
+        & (dataframe["low"] > 0)
+        & (dataframe["close"] > 0)
+        & (dataframe["high"] >= dataframe["low"])
+    ]
+
+    # ---------------------------------------------------------
+    # SORT + DEDUPLICATE
+    # ---------------------------------------------------------
+
     dataframe = (
-        pd.DataFrame(rows)
+        dataframe
+        .sort_values("timestamp")
         .drop_duplicates(
-            subset=[
-                "timestamp"
-            ]
+            subset=["timestamp"],
+            keep="last",
         )
-        .sort_values(
-            "timestamp"
-        )
-        .reset_index(
-            drop=True
+        .reset_index(drop=True)
+    )
+
+    # ---------------------------------------------------------
+    # REMOVE IN-PROGRESS CANDLES
+    # ---------------------------------------------------------
+
+    now_utc = datetime.now(timezone.utc)
+
+    candle_end = (
+        dataframe["timestamp"]
+        + pd.to_timedelta(
+            interval,
+            unit="m",
         )
     )
 
-    CANDLE_CACHE[
-        cache_key
-    ] = (
-        datetime.now(
-            timezone.utc
-        ),
+    dataframe = dataframe[
+        candle_end <= pd.Timestamp(
+            now_utc
+        )
+    ].reset_index(drop=True)
+
+    if dataframe.empty:
+        raise HTTPException(
+            status_code=502,
+            detail={
+                "message": (
+                    "No completed candles available "
+                    "from Upstox."
+                ),
+                "instrument_key": instrument_key,
+                "interval": interval,
+            },
+        )
+
+    # ---------------------------------------------------------
+    # LIMIT LOOKBACK
+    # ---------------------------------------------------------
+
+    # V15 needs at least 220 rows. Keep a margin for indicators
+    # and future validation while avoiding unnecessary data volume.
+    max_required = 350
+
+    if len(dataframe) > max_required:
+        dataframe = dataframe.iloc[
+            -max_required:
+        ].reset_index(drop=True)
+
+    # Stable string representation expected by the existing V16 code.
+    dataframe["timestamp"] = (
+        dataframe["timestamp"]
+        .dt.strftime(
+            "%Y-%m-%dT%H:%M:%S%z"
+        )
+    )
+
+    # Cache only the final clean dataframe.
+    CANDLE_CACHE[cache_key] = (
+        datetime.now(timezone.utc),
         dataframe.copy(),
     )
 
-    return dataframe
+    # ---------------------------------------------------------
+    # DIAGNOSTICS
+    # ---------------------------------------------------------
+
+    try:
+        latest_timestamp = dataframe.iloc[-1]["timestamp"]
+
+        print(
+            "CANDLE FETCH:",
+            instrument_key,
+            f"interval={interval}m",
+            f"rows={len(dataframe)}",
+            f"historical_rows={len(historical_rows)}",
+            f"intraday_rows={len(intraday_rows)}",
+            f"latest={latest_timestamp}",
+        )
+
+        if not intraday_rows:
+            print(
+                "CANDLE FETCH WARNING:",
+                instrument_key,
+                "No current-day intraday rows returned.",
+            )
+
+    except Exception:
+        pass
+
+    return dataframe.copy()
 
 
 # ============================================================
@@ -2206,6 +2481,29 @@ def persist_prediction(
         )
 
         # ----------------------------------------------------
+        # DATA-QUALITY SAFETY GATE
+        # ----------------------------------------------------
+
+        candle_is_stale = bool(
+            analysis.get(
+                "candle_is_stale",
+                False,
+            )
+        )
+
+        if candle_is_stale:
+            return {
+                "saved": False,
+                "duplicate": False,
+                "blocked": True,
+                "reason": "STALE_CANDLE",
+                "candle_timestamp": candle_timestamp,
+                "candle_age_minutes": analysis.get(
+                    "candle_age_minutes"
+                ),
+            }
+
+        # ----------------------------------------------------
         # PREDICTION INTEGRITY GATE
         # ----------------------------------------------------
 
@@ -2552,13 +2850,45 @@ def create_outcome_for_prediction(
 def get_position_price(
     symbol,
 ):
+    """
+    Return the latest tradable reference price.
 
-    instrument = resolve_stock(
-        symbol
+    Supports both:
+      - stocks in STOCKS
+      - NIFTY 50 / BANK NIFTY index instruments
+
+    This is important for automatic outcome resolution, which records
+    observations for both indices and stocks.
+    """
+
+    clean_symbol = (
+        str(symbol)
+        .strip()
+        .upper()
     )
 
+    instrument_map = {
+        "NIFTY 50": NIFTY_TOKEN,
+        "BANK NIFTY": BANKNIFTY_TOKEN,
+        "INDIA VIX": VIX_TOKEN,
+        **STOCKS,
+    }
+
+    instrument = instrument_map.get(
+        clean_symbol
+    )
+
+    if instrument is None:
+        raise HTTPException(
+            status_code=404,
+            detail=(
+                f"Unsupported price symbol: "
+                f"{symbol}"
+            ),
+        )
+
     quote_data = get_single_quote(
-        symbol,
+        clean_symbol,
         instrument,
     )
 
@@ -2567,14 +2897,21 @@ def get_position_price(
     )
 
     if price is None:
-
         raise RuntimeError(
-            f"Price unavailable for {symbol}"
+            f"Price unavailable for {clean_symbol}"
         )
 
-    return safe_float(
-        price
+    value = safe_float(
+        price,
+        0.0,
     )
+
+    if value <= 0:
+        raise RuntimeError(
+            f"Invalid price for {clean_symbol}: {value}"
+        )
+
+    return value
 
 
 # ============================================================
@@ -2654,7 +2991,7 @@ def root():
             "India AI Trader",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "upstox_configured":
             bool(
@@ -2731,7 +3068,7 @@ def health():
             "healthy",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "upstox_configured":
             bool(
@@ -2889,7 +3226,7 @@ def model_status_api():
                 ),
 
             "backend_version":
-                "16.0.0",
+                APP_VERSION,
 
             "production_model":
                 production_model(),
@@ -3072,7 +3409,7 @@ def market_indices():
             "success",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "data":
             data,
@@ -3220,7 +3557,7 @@ def stock_ai(
             "success",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "stock":
             clean_symbol,
@@ -3602,7 +3939,7 @@ def ai_signal():
             "success",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "ai_signal":
             final_signal,
@@ -3821,7 +4158,7 @@ def trade_evaluation(
             "success",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "symbol":
             clean_symbol,
@@ -4711,7 +5048,7 @@ def v16_status():
             "success",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "production_model":
             production_model(),
@@ -5569,7 +5906,7 @@ def scanner(
             "success",
 
         "version":
-            "16.0.0",
+            APP_VERSION,
 
         "count":
             len(results),
