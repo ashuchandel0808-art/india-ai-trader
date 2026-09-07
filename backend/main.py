@@ -877,23 +877,32 @@ app = FastAPI(
 # CORS
 # ============================================================
 
-_configured_origins = [
-    origin.strip().rstrip("/")
-    for origin in os.getenv("CORS_ORIGINS", "").split(",")
-    if origin.strip()
+CORS_ORIGINS = [
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:3001",
+    "http://127.0.0.1:3001",
+    "https://india-ai-trader-frontend-49rs.onrender.com",
 ]
 
-if not _configured_origins:
-    _configured_origins = [
-        "http://localhost:3000",
-        "http://127.0.0.1:3000",
-        "http://localhost:3001",
-        "http://127.0.0.1:3001",
-    ]
+# Optional: allow additional origins from Render environment variables.
+# Example:
+# CORS_ORIGINS=https://example.com,https://another-example.com
+env_cors_origins = os.getenv("CORS_ORIGINS", "")
+
+if env_cors_origins:
+    CORS_ORIGINS.extend(
+        origin.strip()
+        for origin in env_cors_origins.split(",")
+        if origin.strip()
+    )
+
+# Remove duplicates while preserving order.
+CORS_ORIGINS = list(dict.fromkeys(CORS_ORIGINS))
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=_configured_origins,
+    allow_origins=CORS_ORIGINS,
     allow_credentials=False,
     allow_methods=["*"],
     allow_headers=["*"],
